@@ -209,7 +209,7 @@ CONFIGURATIONS:
    -r, -resolvers string[]          list of custom resolver (file or comma separated)
    -allow string[]                  allowed list of IP/CIDR's to process (file or comma separated)
    -deny string[]                   denied list of IP/CIDR's to process (file or comma separated)
-   -sni, -sni-name string           custom TLS SNI name
+   -sni, -sni-name string           custom TLS SNI name (overridden by per-target explicit SNI in vhost format)
    -random-agent                    enable Random User-Agent to use (default true)
    -H, -header string[]             custom http headers to send with request
    -http-proxy, -proxy string       http proxy to use (eg http://127.0.0.1:8080)
@@ -219,7 +219,7 @@ CONFIGURATIONS:
    -maxr, -max-redirects int        max number of redirects to follow per host (default 10)
    -fhr, -follow-host-redirects     follow redirects on the same host
    -rhsts, -respect-hsts            respect HSTS response headers for redirect requests
-   -vhost-input                     get a list of vhosts as input
+   -vhost-input                     get a list of vhosts as input (using format: hostheader[optional_explicit_sni],target)
    -x string                        request methods to probe, use 'all' to probe all HTTP methods
    -body string                     post body to include in http request
    -s, -stream                      stream mode - start elaborating input targets without sorting

@@ -18,14 +18,11 @@ func TestRunner_domain_targets(t *testing.T) {
 	options := &Options{}
 	r, err := New(options)
 	require.Nil(t, err, "could not create httpx runner")
-	input := []string{"example.com", "*.example.com", "example.com,one.one.one.one"}
+	input := []string{"example.com", "*.example.com"}
 	expected := []httpx.Target{{
 		Host: "example.com",
 	}, {
 		Host: "example.com",
-	}, {
-		Host:       "one.one.one.one",
-		CustomHost: "example.com",
 	}}
 	got := []httpx.Target{}
 	for _, inp := range input {
@@ -308,6 +305,241 @@ func TestCreateNetworkpolicyInstance_AllowDenyFlags(t *testing.T) {
 			for _, testCase := range tc.testCases {
 				allowed := np.Validate(testCase.ip)
 				require.Equal(t, testCase.expected, allowed, testCase.reason)
+			}
+		})
+	}
+}
+
+func TestRunner_vhost_basic_parsing(t *testing.T) {
+	options := &Options{
+		VHostInput: true,
+	}
+	r, err := New(options)
+	require.Nil(t, err, "could not create httpx runner")
+	
+	input := []string{
+		"example.com,192.168.1.100",           // Direct IP - no network needed
+		"api.example.com[custom.sni],10.0.0.1", // SNI + private IP
+	}
+	
+	// Helper variables for pointers
+	exampleHost := "example.com"
+	apiHost := "api.example.com"
+	customSNI := "custom.sni"
+	
+	expected := []httpx.Target{
+		{
+			Host:       "192.168.1.100",
+			CustomHost: &exampleHost,
+			CustomSNI:  nil, // Default SNI = hostheader, but not explicitly set
+		},
+		{
+			Host:       "10.0.0.1",
+			CustomHost: &apiHost,
+			CustomSNI:  &customSNI,
+		},
+	}
+	
+	got := []httpx.Target{}
+	for _, inp := range input {
+		for target := range r.targets(r.hp, inp) {
+			got = append(got, target)
+		}
+	}
+	require.ElementsMatch(t, expected, got, "could not get expected output")
+}
+
+func TestRunner_vhost_url_preservation(t *testing.T) {
+	options := &Options{
+		VHostInput: true,
+	}
+	r, err := New(options)
+	require.Nil(t, err, "could not create httpx runner")
+	
+	// URLs with IPs - no DNS resolution needed
+	input := []string{
+		"api.com,http://192.168.1.100/v1?data=[1,2,3]&ids=4,5,6",
+		"example.com[sni.com],https://10.0.0.1:8443/api/test?param=a,b,c",
+	}
+	
+	// Helper variables for pointers
+	apiComHost := "api.com:80"
+	exampleComHost := "example.com:8443"
+	sniCom := "sni.com"
+	
+	expected := []httpx.Target{
+		{
+			Host:       "http://192.168.1.100/v1?data=[1,2,3]&ids=4,5,6",
+			CustomHost: &apiComHost, // Port inheritance from HTTP URL
+			CustomSNI:  nil,         // Default SNI = hostheader (port stripped), but not explicitly set
+		},
+		{
+			Host:       "https://10.0.0.1:8443/api/test?param=a,b,c",
+			CustomHost: &exampleComHost, // Port inheritance from HTTPS URL
+			CustomSNI:  &sniCom,
+		},
+	}
+	
+	got := []httpx.Target{}
+	for _, inp := range input {
+		for target := range r.targets(r.hp, inp) {
+			got = append(got, target)
+		}
+	}
+	require.ElementsMatch(t, expected, got, "could not get expected output")
+}
+
+func TestRunner_vhost_error_handling(t *testing.T) {
+	options := &Options{
+		VHostInput: true,
+	}
+	r, err := New(options)
+	require.Nil(t, err, "could not create httpx runner")
+	
+	// Test error scenarios that should produce no targets
+	errorCases := []struct {
+		name  string
+		input string
+		desc  string
+	}{
+		{
+			name:  "missing_comma",
+			input: "example.com",
+			desc:  "missing comma separator should fail",
+		},
+		{
+			name:  "empty_target",
+			input: "example.com,",
+			desc:  "empty target should fail",
+		},
+		{
+			name:  "unclosed_bracket",
+			input: "example.com[unclosed,192.168.1.1",
+			desc:  "unclosed SNI bracket should fail",
+		},
+		{
+			name:  "sni_with_port",
+			input: "example.com[api.com:8080],192.168.1.1",
+			desc:  "SNI with port should fail (RFC violation)",
+		},
+	}
+	
+	// Test valid edge cases that should work
+	validCases := []struct {
+		name         string
+		input        string
+		expectedHost string
+		description  string
+	}{
+		{
+			name:         "empty_hostheader",
+			input:        ",192.168.1.1",
+			expectedHost: "192.168.1.1",
+			description:  "empty hostheader should be allowed",
+		},
+		{
+			name:         "empty_sni",
+			input:        "example.com[],192.168.1.2",
+			expectedHost: "192.168.1.2", 
+			description:  "empty SNI should be allowed",
+		},
+	}
+	
+	for _, tc := range errorCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := []httpx.Target{}
+			for target := range r.targets(r.hp, tc.input) {
+				got = append(got, target)
+			}
+			require.Equal(t, 0, len(got), tc.desc)
+		})
+	}
+	
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := []httpx.Target{}
+			for target := range r.targets(r.hp, tc.input) {
+				got = append(got, target)
+			}
+			require.Equal(t, 1, len(got), tc.description)
+			require.Equal(t, tc.expectedHost, got[0].Host, "should have correct host")
+		})
+	}
+}
+
+func TestRunner_portInheritanceIntegration(t *testing.T) {
+	options := &Options{
+		VHostInput: true,
+	}
+	r, err := New(options)
+	require.Nil(t, err, "could not create httpx runner")
+	
+	// Helper function to create string pointers
+	stringPtr := func(s string) *string { return &s }
+	
+	// Focus on key port inheritance scenarios
+	testCases := []struct {
+		name           string
+		input          string
+		expectedHost   string
+		expectedCustomHost *string
+		expectedCustomSNI  *string
+	}{
+		{
+			name:               "basic port inheritance",
+			input:              "api.com,https://backend.com:8443",
+			expectedHost:       "https://backend.com:8443",
+			expectedCustomHost: stringPtr("api.com:8443"),
+			expectedCustomSNI:  nil, // Default SNI, not explicitly set
+		},
+		{
+			name:               "explicit port overrides inheritance",
+			input:              "api.com:9000,backend.com:8443",
+			expectedHost:       "backend.com:8443",
+			expectedCustomHost: stringPtr("api.com:9000"),
+			expectedCustomSNI:  nil, // Default SNI, not explicitly set
+		},
+		{
+			name:               "IPv6 with port inheritance",
+			input:              "2001:db8::1,backend.com:8080",
+			expectedHost:       "backend.com:8080",
+			expectedCustomHost: stringPtr("[2001:db8::1]:8080"),
+			expectedCustomSNI:  nil, // IPv6 addresses omitted from SNI per RFC 6066, not explicitly set
+		},
+		{
+			name:               "SNI port stripping with explicit SNI",
+			input:              "api.com[custom.com],backend.com:9000",
+			expectedHost:       "backend.com:9000", 
+			expectedCustomHost: stringPtr("api.com:9000"),
+			expectedCustomSNI:  stringPtr("custom.com"),
+		},
+	}
+	
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := []httpx.Target{}
+			for target := range r.targets(r.hp, tc.input) {
+				got = append(got, target)
+			}
+			
+			require.Equal(t, 1, len(got), "should produce exactly one target for %s", tc.name)
+			target := got[0]
+			
+			require.Equal(t, tc.expectedHost, target.Host, "Host field mismatch for %s", tc.name)
+			
+			// Compare pointer values properly
+			if tc.expectedCustomHost == nil {
+				require.Nil(t, target.CustomHost, "CustomHost should be nil for %s", tc.name)
+			} else {
+				require.NotNil(t, target.CustomHost, "CustomHost should not be nil for %s", tc.name)
+				require.Equal(t, *tc.expectedCustomHost, *target.CustomHost, "CustomHost field mismatch for %s", tc.name)
+			}
+			
+			if tc.expectedCustomSNI == nil {
+				require.Nil(t, target.CustomSNI, "CustomSNI should be nil for %s", tc.name)
+			} else {
+				require.NotNil(t, target.CustomSNI, "CustomSNI should not be nil for %s", tc.name)
+				require.Equal(t, *tc.expectedCustomSNI, *target.CustomSNI, "CustomSNI field mismatch for %s", tc.name)
 			}
 		})
 	}

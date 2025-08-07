@@ -42,7 +42,8 @@ type Result struct {
 	ExtractRegex       []string                      `json:"extract_regex,omitempty" csv:"extract_regex" mapstructure:"extract_regex"`
 	CDNName            string                        `json:"cdn_name,omitempty" csv:"cdn_name" mapstructure:"cdn_name"`
 	CDNType            string                        `json:"cdn_type,omitempty" csv:"cdn_type" mapstructure:"cdn_type"`
-	SNI                string                        `json:"sni,omitempty" csv:"sni" mapstructure:"sni"`
+	SNI                *string                       `json:"sni,omitempty" csv:"sni" mapstructure:"sni"`
+	HostHeader         *string                       `json:"host_header,omitempty" csv:"host_header" mapstructure:"host_header"`
 	Port               string                        `json:"port,omitempty" csv:"port" mapstructure:"port"`
 	Raw                string                        `json:"-" csv:"-" mapstructure:"-"`
 	URL                string                        `json:"url,omitempty" csv:"url" mapstructure:"url"`

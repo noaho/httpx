@@ -360,6 +360,16 @@ func (h *HTTPX) doUnsafeWithOptions(req *retryablehttp.Request, unsafeOptions Un
 	method := req.Method
 	headers := req.Header
 	targetURL := req.URL.String()
+	
+	// Fix for vhost: if we have a custom Host header, use it in the URL to ensure
+	// rawhttp constructs the request with the correct Host header
+	if req.Host != "" && req.Host != req.URL.Host {
+		// Replace the host in the URL with the custom host
+		u := *req.URL
+		u.Host = req.Host
+		targetURL = u.String()
+	}
+	
 	body := req.Body
 	options := rawhttp.DefaultOptions
 	options.Timeout = h.Options.Timeout

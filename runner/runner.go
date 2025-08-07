@@ -890,10 +890,6 @@ func (r *Runner) RunEnumeration() {
 		}
 
 		for resp := range output {
-			if r.options.SniName != "" {
-				resp.SNI = r.options.SniName
-			}
-
 			if resp.Err != nil {
 				// Change the error message if any port value passed explicitly
 				if url, err := r.parseURL(resp.URL); err == nil && url.Port() != "" {
@@ -1123,13 +1119,20 @@ func (r *Runner) RunEnumeration() {
 					screenshotPath = fileutilz.AbsPathOrDefault(filepath.Join(screenshotBaseDir, screenshotResponseFile))
 					screenshotPathRel = filepath.Join(hostFilename, screenshotResponseFile)
 					_ = fileutil.CreateFolder(screenshotBaseDir)
-					err := os.WriteFile(screenshotPath, resp.ScreenshotBytes, 0644)
-					if err != nil {
-						gologger.Error().Msgf("Could not write screenshot at path '%s', to disk: %s", screenshotPath, err)
+					
+					// Only write screenshot file if we have actual screenshot data
+					if len(resp.ScreenshotBytes) > 0 {
+						err := os.WriteFile(screenshotPath, resp.ScreenshotBytes, 0644)
+						if err != nil {
+							gologger.Error().Msgf("Could not write screenshot at path '%s', to disk: %s", screenshotPath, err)
+						} else {
+							resp.ScreenshotPath = screenshotPath
+							resp.ScreenshotPathRel = screenshotPathRel
+						}
+					} else {
+						gologger.Warning().Msgf("Skipping empty screenshot for '%s'", resp.URL)
 					}
-
-					resp.ScreenshotPath = screenshotPath
-					resp.ScreenshotPathRel = screenshotPathRel
+					
 					if r.scanopts.NoScreenshotBytes {
 						resp.ScreenshotBytes = []byte{}
 					}
@@ -1268,8 +1271,24 @@ func (r *Runner) RunEnumeration() {
 		}
 
 		protocol := r.options.protocol
-		// attempt to parse url as is
-		if u, err := r.parseURL(k); err == nil {
+		var processedInput string
+		
+		if r.options.VHostInput {
+			// Parse vhost input first and extract target for further processing
+			_, target, _, _, err := parseVhostInput(k)
+			if err != nil {
+				gologger.Warning().Msgf("%s", err)
+				return nil // Skip this entry but continue processing others
+			}
+			processedInput = target
+			// Store vhost info for later use in targets()
+			// We'll pass the original input k to process() so targets() can re-parse it
+		} else {
+			processedInput = k
+		}
+		
+		// attempt to parse url to determine protocol
+		if u, err := r.parseURL(processedInput); err == nil {
 			if r.options.NoFallbackScheme && u.Scheme == httpx.HTTP || u.Scheme == httpx.HTTPS {
 				protocol = u.Scheme
 			}
@@ -1484,8 +1503,350 @@ func (r *Runner) process(t string, wg *syncutil.AdaptiveWaitGroup, hp *httpx.HTT
 	}
 }
 
-// returns all the targets within a cidr range or the single target
+// targets delegates to expandTarget for actual target expansion, and adds vhost/SNI to the targets if enabled
 func (r *Runner) targets(hp *httpx.HTTPX, target string) chan httpx.Target {
+	results := make(chan httpx.Target)
+	go func() {
+		defer close(results)
+		
+		// Check if vhost input mode is enabled and pre-process the input
+		var processedTarget string
+		var hostheader string
+		var customSNI, customHost *string
+		
+		if r.options.VHostInput {
+			// Parse as vhost format: hostheader[sni],target
+			var err error
+			hostheader, processedTarget, customSNI, customHost, err = parseVhostInput(target)
+			if err != nil {
+				// When -vhost-input is enabled, invalid input should be rejected
+				gologger.Warning().Msgf("%s\n", err)
+				return
+			}
+			// Strip wildcard prefixes from hostheader to match expandTarget behavior
+			hostheader = stringsutil.TrimPrefixAny(hostheader, "*", ".")
+		} else {
+			// Standard format - use target as-is
+			processedTarget = target
+		}
+		
+		// Expand the processed target
+		for expandedTarget := range r.expandTarget(hp, processedTarget) {
+			if r.options.VHostInput {
+				// Apply port inheritance and clearing logic to CustomHost
+				finalHostheader := r.applyPortLogic(hostheader, expandedTarget)
+				
+				if customHost != nil {
+					// Create new pointer with the processed host header
+					finalHostheaderCopy := finalHostheader
+					expandedTarget.CustomHost = &finalHostheaderCopy
+				}
+				expandedTarget.CustomSNI = customSNI
+			}
+			results <- expandedTarget
+		}
+	}()
+	return results
+}
+
+// parseVhostInput parses vhost input in the format: hostheader[sni],target
+//
+// Examples:
+//   "example.com,1.1.1.1" -> hostheader="example.com", sni="example.com", target="1.1.1.1"
+//   "example.com[custom.sni],1.1.1.1" -> hostheader="example.com", sni="custom.sni", target="1.1.1.1"
+//   "example.com[],1.1.1.1" -> hostheader="example.com", sni="", target="1.1.1.1"
+//   ",1.1.1.1" -> hostheader="", sni="", target="1.1.1.1"
+//
+// Returns hostheader, target, customSNI pointer, customHost pointer, and error
+// The SNI value is available through the customSNI pointer when explicitly set
+func parseVhostInput(input string) (hostheader, target string, customSNI, customHost *string, err error) {
+	var sni string // Local variable for SNI processing
+	
+	// Find the first comma - everything before is hostheader[sni], everything after is target
+	commaIndex := strings.Index(input, ",")
+	if commaIndex == -1 {
+		return "", "", nil, nil, fmt.Errorf("invalid vhost input format: missing comma separator")
+	}
+	
+	// Split into hostheader[sni] and target parts
+	hostPart := input[:commaIndex]
+	target = strings.TrimSpace(input[commaIndex+1:])
+	
+	// Check if target is empty
+	if target == "" {
+		return "", "", nil, nil, fmt.Errorf("invalid vhost input format: missing target")
+	}
+	
+	// Always set customHost for vhost format when target is valid
+	customHost = &hostheader
+	
+	// Parse hostheader[sni] part
+	// Distinguish between IPv6 addresses [2001:db8::1]:port and SNI format hostname[sni]  
+	// IPv6 addresses start with [ and contain :, SNI format has hostname before [
+	isIPv6Address := strings.HasPrefix(hostPart, "[") && strings.Contains(hostPart, ":")
+	hasSNIFormat := strings.Contains(hostPart, "[") && !isIPv6Address
+	
+	if hasSNIFormat {
+		if !strings.HasSuffix(hostPart, "]") {
+			return "", "", nil, nil, fmt.Errorf("invalid vhost input format: unclosed SNI bracket")
+		}
+		
+		parts := strings.SplitN(hostPart, "[", 2)
+		if len(parts) != 2 {
+			return "", "", nil, nil, fmt.Errorf("invalid vhost input format: invalid SNI bracket syntax")
+		}
+		
+		hostheader = strings.TrimSpace(parts[0])
+		sniPart := strings.TrimSpace(strings.TrimSuffix(parts[1], "]"))
+		
+		// STRICT validation for explicit SNI (user provided in brackets)
+		// We don't strip ports - we reject them to be explicit about user intent
+		if sniPart != "" {
+			// Check for URL schemes (not allowed in explicit SNI)
+			if strings.Contains(sniPart, "://") {
+				if u, _ := url.Parse(sniPart); u != nil && u.Scheme != "" {
+					return "", "", nil, nil, fmt.Errorf("invalid vhost input format: URL schemes not allowed in SNI hostname '%s' (detected scheme: %s)", 
+						sniPart, u.Scheme)
+				}
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: URL schemes not allowed in SNI hostname '%s'", sniPart)
+			}
+			
+			// Check for ports (not allowed in explicit SNI - reject, don't strip)
+			if _, _, err := net.SplitHostPort(sniPart); err == nil {
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: SNI hostname should not contain ports '%s' (use port-free SNI)", sniPart)
+			}
+			
+			// RFC 6066: SNI must be a DNS hostname, not an IP address
+			if isIPAddress(sniPart) {
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: IP addresses not allowed in SNI '%s' (RFC 6066 requires DNS hostname)", sniPart)
+			}
+			
+			// Validate as hostname
+			if err := validateHostname(sniPart); err != nil {
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: invalid SNI hostname '%s': %v", sniPart, err)
+			}
+		}
+		
+		sni = sniPart // Use explicit SNI as-is (already validated)
+		
+		// Empty SNI in brackets is allowed - it explicitly clears the SNI
+	} else {
+		// Format: hostheader (no explicit SNI)
+		hostheader = strings.TrimSpace(hostPart)
+		
+		// Default SNI to hostheader when not explicitly specified, but strip port
+		// If hostheader is empty, SNI will also be empty (blank Host header case)
+		if hostheader != "" {
+			var sniValue string
+			if host, _, err := net.SplitHostPort(hostheader); err == nil {
+				sniValue = host // Strip port from hostheader for SNI
+			} else {
+				sniValue = hostheader // No port found, use as-is
+			}
+			
+			// RFC 6066: Clear SNI if it would be an IP address
+			if !isIPAddress(sniValue) {
+				sni = sniValue
+			} else {
+				sni = "" // IP addresses not allowed in SNI per RFC 6066
+			}
+		} else {
+			sni = "" // Empty hostheader = empty SNI
+		}
+	}
+	
+	// Validate hostheader (allows ports) and SNI (ports already stripped)
+	
+	// Validate hostheader - allows ports, IPs, and hostnames
+	if hostheader != "" {
+		// Check for URL schemes (not allowed) - :// is unambiguous indicator
+		if strings.Contains(hostheader, "://") {
+			if u, _ := url.Parse(hostheader); u != nil && u.Scheme != "" {
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: URL schemes not allowed in hostname '%s' (detected scheme: %s)", 
+					hostheader, u.Scheme)
+			}
+			return "", "", nil, nil, fmt.Errorf("invalid vhost input format: URL schemes not allowed in hostname '%s'", hostheader)
+		}
+		
+		// Try parsing as hostname:port first (most common case with ports)
+		if host, port, err := net.SplitHostPort(hostheader); err == nil {
+			// Successfully parsed as host:port, validate the host part
+			if err := validateHostnameOrIP(host); err != nil {
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: invalid hostname in '%s': %v", hostheader, err)
+			}
+			// Validate port is numeric
+			if port != "" {
+				if _, err := strconv.Atoi(port); err != nil {
+					return "", "", nil, nil, fmt.Errorf("invalid vhost input format: invalid port '%s' in '%s'", port, hostheader)
+				}
+			}
+		} else {
+			// No port, validate as plain hostname or IP
+			if err := validateHostnameOrIP(hostheader); err != nil {
+				return "", "", nil, nil, fmt.Errorf("invalid vhost input format: invalid hostname '%s': %v", hostheader, err)
+			}
+		}
+	}
+	
+	// Note: SNI validation is handled separately for explicit SNI (in brackets) vs derived SNI
+	// - Explicit SNI: Strict validation in bracket parsing section above
+	// - Derived SNI: Permissive processing with automatic port stripping
+	
+	// Set customSNI pointer only if SNI was explicitly specified in brackets
+	if hasSNIFormat {
+		customSNI = &sni
+	}
+	// If no brackets were used, customSNI remains nil even if we derived a default SNI value
+	
+	return hostheader, target, customSNI, customHost, nil
+}
+
+// applyPortLogic handles port inheritance and clearing for Host headers
+// - If hostheader has no port, inherit from target
+// - If hostheader ends with ":", clear the port (explicit no port)
+// - If hostheader already has a port, keep it as-is
+func (r *Runner) applyPortLogic(hostheader string, target httpx.Target) string {
+	// Empty hostheader - no port logic needed
+	if hostheader == "" {
+		return hostheader
+	}
+	
+	// Check if hostheader ends with ":" (explicit port clearing)
+	if strings.HasSuffix(hostheader, ":") {
+		return strings.TrimSuffix(hostheader, ":") // Remove trailing colon
+	}
+	
+	// Check if hostheader already has a port
+	if _, port, err := net.SplitHostPort(hostheader); err == nil && port != "" {
+		return hostheader // Already has port, keep as-is
+	}
+	
+	// No port in hostheader, try to inherit from target
+	targetPort := r.extractPortFromTarget(target)
+	if targetPort != "" {
+		// Handle IPv6 addresses properly
+		if strings.Contains(hostheader, ":") && !strings.HasPrefix(hostheader, "[") {
+			// Might be IPv6 without brackets
+			return "[" + hostheader + "]:" + targetPort
+		}
+		return hostheader + ":" + targetPort
+	}
+	
+	return hostheader // No port to inherit
+}
+
+// extractPortFromTarget extracts the port from a target for inheritance
+func (r *Runner) extractPortFromTarget(target httpx.Target) string {
+	// Try to extract port from target.Host (which contains the URL or hostname)
+	if target.Host != "" {
+		// Try parsing as URL first
+		if u, err := url.Parse(target.Host); err == nil && u.Host != "" {
+			if port := u.Port(); port != "" {
+				return port
+			}
+			// Default ports based on scheme
+			switch u.Scheme {
+			case "https":
+				return "443"
+			case "http":
+				return "80"
+			}
+		}
+		
+		// Try extracting port directly from Host field
+		if _, port, err := net.SplitHostPort(target.Host); err == nil && port != "" {
+			return port
+		}
+		
+		// If Host looks like a URL without explicit port, try scheme-based defaults
+		if strings.HasPrefix(target.Host, "https://") {
+			return "443"
+		} else if strings.HasPrefix(target.Host, "http://") {
+			return "80"
+		}
+	}
+	
+	return "" // No port found
+}
+
+// validateHostnameOrIP validates that a string is either a valid IP address or hostname
+func validateHostnameOrIP(value string) error {
+	if value == "" {
+		return nil // Empty values are allowed
+	}
+	
+	// Check if it's a bracketed IPv6 address [2001:db8::1]
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		ipv6Addr := value[1 : len(value)-1] // Remove brackets
+		if net.ParseIP(ipv6Addr) != nil {
+			return nil // Valid bracketed IPv6 address
+		}
+	}
+	
+	// Check if it's a raw IP address (IPv4 or IPv6)
+	if net.ParseIP(value) != nil {
+		return nil // Valid IP address
+	}
+	
+	// Check if it's a valid hostname using URL parsing
+	// This approach handles internationalized domain names and various edge cases
+	testURL := "http://" + value + "/"
+	u, err := url.Parse(testURL)
+	if err != nil {
+		return fmt.Errorf("malformed hostname")
+	}
+	
+	// For bracketed IPv6, u.Hostname() returns the IPv6 without brackets
+	expectedHostname := value
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		expectedHostname = value[1 : len(value)-1] // Compare without brackets
+	}
+	
+	// Verify that url.Parse extracted the hostname correctly
+	if u.Hostname() != expectedHostname {
+		return fmt.Errorf("invalid hostname format")
+	}
+	
+	return nil // Valid hostname
+}
+
+// isIPAddress checks if a string is an IP address (IPv4 or IPv6)
+func isIPAddress(value string) bool {
+	// Handle bracketed IPv6 addresses [2001:db8::1] by stripping brackets
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		value = value[1 : len(value)-1]
+	}
+	return net.ParseIP(value) != nil
+}
+
+// validateHostname validates that a string is a valid hostname (not an IP)
+func validateHostname(value string) error {
+	if value == "" {
+		return nil // Empty values are allowed  
+	}
+	
+	// Reject IP addresses
+	if isIPAddress(value) {
+		return fmt.Errorf("expected hostname but got IP address")
+	}
+	
+	// Check if it's a valid hostname using URL parsing
+	testURL := "http://" + value + "/"
+	u, err := url.Parse(testURL)
+	if err != nil {
+		return fmt.Errorf("malformed hostname")
+	}
+	
+	// Verify that url.Parse extracted the hostname correctly
+	if u.Hostname() != value {
+		return fmt.Errorf("invalid hostname format")
+	}
+	
+	return nil // Valid hostname
+}
+
+// expandTarget handles target expansion (ASN, CIDR, wildcards, etc.)
+func (r *Runner) expandTarget(hp *httpx.HTTPX, target string) chan httpx.Target {
 	results := make(chan httpx.Target)
 	go func() {
 		defer close(results)
@@ -1532,9 +1893,6 @@ func (r *Runner) targets(hp *httpx.HTTPX, target string) chan httpx.Target {
 			for _, ip := range ips {
 				results <- httpx.Target{Host: target, CustomIP: ip}
 			}
-		case !stringsutil.HasPrefixAny(target, "http://", "https://") && stringsutil.ContainsAny(target, ","):
-			idxComma := strings.Index(target, ",")
-			results <- httpx.Target{Host: target[idxComma+1:], CustomHost: target[:idxComma]}
 		default:
 			results <- httpx.Target{Host: target}
 		}
@@ -1548,8 +1906,9 @@ func (r *Runner) analyze(hp *httpx.HTTPX, protocol string, target httpx.Target, 
 		protocol = httpx.HTTPS
 	}
 	retried := false
+	var effectiveSNI string
 retry:
-	if scanopts.VHostInput && target.CustomHost == "" {
+	if scanopts.VHostInput && (target.CustomHost == nil || *target.CustomHost == "") {
 		return Result{Input: origInput}
 	}
 	URL, err := r.parseURL(target.Host)
@@ -1587,24 +1946,51 @@ retry:
 		req *retryablehttp.Request
 		ctx context.Context
 	)
-	if target.CustomIP != "" {
+	// Create base context
+	ctx = context.Background()
+	
+	// Handle CustomIP
+	if target.CustomIP != "" && r.options.Proxy == "" {
+		// Only use fastdialer custom IP when no proxy is configured
+		// When proxy is configured, let the proxy handle the connection
 		var requestIP string
 		if iputil.IsIPv6(target.CustomIP) {
 			requestIP = fmt.Sprintf("[%s]", target.CustomIP)
 		} else {
 			requestIP = target.CustomIP
 		}
-		ctx = context.WithValue(context.Background(), fastdialer.IP, requestIP)
-	} else {
-		ctx = context.Background()
+		ctx = context.WithValue(ctx, fastdialer.IP, requestIP)
+	}
+	
+	// Handle CustomSNI - this works with or without proxy
+	if target.CustomSNI != nil {
+		// Per-target SNI was explicitly set (even if empty)
+		// Warn if global SNI flag is being overridden
+		if r.options.SniName != "" && r.options.SniName != *target.CustomSNI {
+			gologger.Warning().Msgf("Global -sni flag '%s' will be overridden by per-target SNI '%s' for target '%s'", 
+				r.options.SniName, *target.CustomSNI, origInput)
+		}
+		ctx = context.WithValue(ctx, fastdialer.SniName, *target.CustomSNI)
+		effectiveSNI = *target.CustomSNI
+	} else if r.options.SniName != "" {
+		// Use global SNI if no per-target SNI
+		effectiveSNI = r.options.SniName
 	}
 	req, err = hp.NewRequestWithContext(ctx, method, URL.String())
 	if err != nil {
 		return Result{URL: URL.String(), Input: origInput, Err: err}
 	}
 
-	if target.CustomHost != "" {
-		req.Host = target.CustomHost
+	if target.CustomHost != nil {
+		// CustomHost was explicitly set via vhost-input (even if empty)
+		req.Host = *target.CustomHost
+	} else if target.CustomIP != "" && r.options.Proxy != "" {
+		// When using proxy with vhost-input, preserve the original hostname in Host header
+		// The proxy will handle routing to the CustomIP
+		req.Host = URL.Hostname()
+		if URL.Port() != "" {
+			req.Host = net.JoinHostPort(URL.Hostname(), URL.Port())
+		}
 	}
 
 	if !scanopts.LeaveDefaultPorts {
@@ -2139,7 +2525,7 @@ retry:
 	}
 
 	// store responses or chain in directory
-	domainFile := method + ":" + URL.EscapedString()
+	domainFile := method + ":" + URL.EscapedString() + ":" + URL.Host
 	hash := hashes.Sha1([]byte(domainFile))
 	domainResponseFile := fmt.Sprintf("%s.txt", hash)
 	hostFilename := strings.ReplaceAll(URL.Host, ":", "_")
@@ -2208,7 +2594,42 @@ retry:
 	var pHash uint64
 	if scanopts.Screenshot {
 		var err error
-		screenshotBytes, headlessBody, err = r.browser.ScreenshotWithBody(fullURL, scanopts.ScreenshotTimeout, scanopts.ScreenshotIdle, r.options.CustomHeaders, scanopts.IsScreenshotFullPage())
+		
+		// Handle vhost input for screenshots using IP-based URL with Host header injection
+		screenshotURL := fullURL
+		var hostResolverRules string
+		
+		var customHost string
+		if target.CustomHost != nil {
+			customHost = *target.CustomHost
+		}
+		gologger.Debug().Msgf("Screenshot debug: target.CustomHost='%s', target.Host='%s', fullURL='%s'", customHost, target.Host, fullURL)
+		
+		if target.CustomHost != nil && *target.CustomHost != "" {
+			// For vhost input, use hostname URL but configure Chrome to resolve it to the target IP
+			// This handles true vhost scenarios where DNS doesn't resolve correctly
+			screenshotURL = fullURL // Use hostname URL
+			
+			// Parse target IP from target.Host
+			var targetIP string
+			if u, err := url.Parse(target.Host); err == nil {
+				targetIP = strings.Split(u.Host, ":")[0] // Remove port if present
+				// Extract port if present
+				port := "443" // default for HTTPS
+				if strings.Contains(u.Host, ":") {
+					port = strings.Split(u.Host, ":")[1]
+				}
+				hostResolverRules = fmt.Sprintf("MAP %s %s:%s", *target.CustomHost, targetIP, port)
+				gologger.Debug().Msgf("Using vhost screenshot with host resolver rules: '%s' -> %s:%s", screenshotURL, targetIP, port)
+			}
+		}
+		
+		if hostResolverRules != "" {
+			screenshotBytes, headlessBody, err = r.browser.ScreenshotWithBodyAndHostRules(screenshotURL, scanopts.ScreenshotTimeout, scanopts.ScreenshotIdle, r.options.CustomHeaders, scanopts.IsScreenshotFullPage(), hostResolverRules)
+		} else {
+			screenshotBytes, headlessBody, err = r.browser.ScreenshotWithBody(screenshotURL, scanopts.ScreenshotTimeout, scanopts.ScreenshotIdle, r.options.CustomHeaders, scanopts.IsScreenshotFullPage())
+		}
+		
 		if err != nil {
 			gologger.Warning().Msgf("Could not take screenshot '%s': %s", fullURL, err)
 		} else {
@@ -2270,6 +2691,7 @@ retry:
 		Title:            title,
 		str:              builder.String(),
 		VHost:            isvhost,
+		HostHeader:       getHostHeaderForOutput(target, req),
 		WebServer:        serverHeader,
 		ResponseBody:     serverResponseRaw,
 		BodyPreview:      bodyPreview,
@@ -2311,6 +2733,7 @@ retry:
 		RequestRaw:        requestDump,
 		Response:          resp,
 		FaviconData:       faviconData,
+		SNI:              getSNIForOutput(target, effectiveSNI, r.options.SniName),
 	}
 	if resp.BodyDomains != nil {
 		result.Fqdns = resp.BodyDomains.Fqdns
@@ -2627,6 +3050,26 @@ func (r *Runner) parseURL(url string) (*urlutil.URL, error) {
 		gologger.Debug().Msgf("failed to parse url %v got %v in unsafe:%v", url, err, r.options.Unsafe)
 	}
 	return urlx, err
+}
+
+// getHostHeaderForOutput returns the Host header value only when explicitly set via vhost-input
+func getHostHeaderForOutput(target httpx.Target, req *retryablehttp.Request) *string {
+	if target.CustomHost != nil && req != nil {
+		return &req.Host // Return pointer to the custom Host header that was explicitly set
+	}
+	return nil // Return nil to omit from JSON output (due to omitempty tag)
+}
+
+// getSNIForOutput returns the SNI value only when explicitly set (not derived from host header)  
+func getSNIForOutput(target httpx.Target, effectiveSNI, globalSNI string) *string {
+	if target.CustomSNI != nil {
+		// Per-target SNI was explicitly set (even if empty string)
+		return &effectiveSNI
+	} else if globalSNI != "" {
+		// Global -sni flag was explicitly set
+		return &effectiveSNI
+	}
+	return nil // Return nil to omit from JSON output (was derived from host header)
 }
 
 func getDNSData(hp *httpx.HTTPX, hostname string) (ips, cnames, resolvers []string, err error) {
