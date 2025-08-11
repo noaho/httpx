@@ -1845,6 +1845,28 @@ func validateHostname(value string) error {
 	return nil // Valid hostname
 }
 
+// deriveSNIFromHostHeader derives SNI value from Host header per RFC 6066
+// Strips ports and returns empty string for IP addresses (RFC 6066 compliance)
+func deriveSNIFromHostHeader(hostHeader string) string {
+	if hostHeader == "" {
+		return ""
+	}
+	
+	// Strip port if present
+	hostname := hostHeader
+	if host, _, err := net.SplitHostPort(hostHeader); err == nil {
+		hostname = host
+	}
+	
+	// RFC 6066: SNI must be a DNS hostname, not an IP address
+	if isIPAddress(hostname) {
+		return "" // Return empty for IP addresses
+	}
+	
+	// Return the hostname for valid DNS names
+	return hostname
+}
+
 // expandTarget handles target expansion (ASN, CIDR, wildcards, etc.)
 func (r *Runner) expandTarget(hp *httpx.HTTPX, target string) chan httpx.Target {
 	results := make(chan httpx.Target)
@@ -1975,6 +1997,13 @@ retry:
 	} else if r.options.SniName != "" {
 		// Use global SNI if no per-target SNI
 		effectiveSNI = r.options.SniName
+	} else if scanopts.VHostInput && target.CustomHost != nil {
+		// For vhost input without explicit SNI, derive SNI from Host header (RFC 6066 compliant)
+		derivedSNI := deriveSNIFromHostHeader(*target.CustomHost)
+		if derivedSNI != "" {
+			ctx = context.WithValue(ctx, fastdialer.SniName, derivedSNI)
+			effectiveSNI = derivedSNI
+		}
 	}
 	req, err = hp.NewRequestWithContext(ctx, method, URL.String())
 	if err != nil {
