@@ -1118,10 +1118,10 @@ func (r *Runner) RunEnumeration() {
 				if r.scanopts.Screenshot {
 					screenshotPath = fileutilz.AbsPathOrDefault(filepath.Join(screenshotBaseDir, screenshotResponseFile))
 					screenshotPathRel = filepath.Join(hostFilename, screenshotResponseFile)
-					_ = fileutil.CreateFolder(screenshotBaseDir)
 					
-					// Only write screenshot file if we have actual screenshot data
+					// Only create directory and write screenshot file if we have actual screenshot data
 					if len(resp.ScreenshotBytes) > 0 {
+						_ = fileutil.CreateFolder(screenshotBaseDir)
 						err := os.WriteFile(screenshotPath, resp.ScreenshotBytes, 0644)
 						if err != nil {
 							gologger.Error().Msgf("Could not write screenshot at path '%s', to disk: %s", screenshotPath, err)
