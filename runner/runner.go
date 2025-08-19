@@ -1939,9 +1939,19 @@ retry:
 	}
 
 	// check if we have to skip the host:port as a result of a previous failure
-	hostPort := net.JoinHostPort(URL.Host, URL.Port())
-	if r.options.HostMaxErrors >= 0 && r.HostErrorsCache.Has(hostPort) {
-		numberOfErrors, err := r.HostErrorsCache.GetIFPresent(hostPort)
+	// For vhost-input mode, include the vhost hostname in the tracking key to avoid
+	// different vhost hostnames being affected by failures of the same target IP
+	var errorTrackingKey string
+	if scanopts.VHostInput && target.CustomHost != nil && *target.CustomHost != "" {
+		// Use "vhost:hostname->target:port" format for vhost scenarios
+		errorTrackingKey = fmt.Sprintf("vhost:%s->%s", *target.CustomHost, net.JoinHostPort(URL.Host, URL.Port()))
+	} else {
+		// Use traditional "target:port" format for non-vhost scenarios  
+		errorTrackingKey = net.JoinHostPort(URL.Host, URL.Port())
+	}
+	
+	if r.options.HostMaxErrors >= 0 && r.HostErrorsCache.Has(errorTrackingKey) {
+		numberOfErrors, err := r.HostErrorsCache.GetIFPresent(errorTrackingKey)
 		if err == nil && numberOfErrors >= r.options.HostMaxErrors {
 			return Result{URL: target.Host, Err: errors.New("skipping as previously unresponsive")}
 		}
@@ -2138,11 +2148,11 @@ retry:
 
 		// mark the host:port as failed to avoid further checks
 		if r.options.HostMaxErrors >= 0 {
-			errorCount, err := r.HostErrorsCache.GetIFPresent(hostPort)
+			errorCount, err := r.HostErrorsCache.GetIFPresent(errorTrackingKey)
 			if err != nil || errorCount == 0 {
-				_ = r.HostErrorsCache.Set(hostPort, 1)
+				_ = r.HostErrorsCache.Set(errorTrackingKey, 1)
 			} else if errorCount > 0 {
-				_ = r.HostErrorsCache.Set(hostPort, errorCount+1)
+				_ = r.HostErrorsCache.Set(errorTrackingKey, errorCount+1)
 			}
 		}
 

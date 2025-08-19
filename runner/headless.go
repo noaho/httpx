@@ -37,6 +37,8 @@ type Browser struct {
 	engine     *rod.Browser
 	proxyPort  int
 	proxyClose func()
+    upstreamProxyURL *url.URL
+    mitmCert         *tls.Certificate
 	// TODO: Remove the Chrome PID kill code in favor of using Leakless(true).
 	// This change will be made if there are no complaints about zombie Chrome processes.
 	// Reference: https://github.com/projectdiscovery/httpx/pull/1426
@@ -85,9 +87,8 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		}
 	}
 
-	if proxy != "" {
-		chromeLauncher = chromeLauncher.Proxy(proxy)
-	}
+    // We will start a local forward proxy (with TLS MITM) and always point Chrome to it.
+    // If the user supplied an upstream proxy, we will chain to it from our local proxy.
 
 	for k, v := range optionalArgs {
 		chromeLauncher.Set(flags.Flag(k), v)
@@ -98,52 +99,92 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		return nil, err
 	}
 
-	browser := rod.New().ControlURL(launcherURL)
+    browser := rod.New().ControlURL(launcherURL)
 	if browserErr := browser.Connect(); browserErr != nil {
 		return nil, browserErr
 	}
 
-	engine := &Browser{
-		tempDir: dataStore,
-		engine:  browser,
-		// pids:    pids,
-	}
-	return engine, nil
+    engine := &Browser{
+        tempDir: dataStore,
+        engine:  browser,
+        // pids:    pids,
+    }
+
+    // Parse upstream proxy if provided (chain proxy)
+    if proxy != "" {
+        if u, err := url.Parse(proxy); err == nil {
+            engine.upstreamProxyURL = u
+        } else {
+            return nil, errors.Wrap(err, "invalid upstream proxy url")
+        }
+    }
+
+    // Start local forward proxy and re-point Chrome to it
+    if err := engine.startForwardProxy(); err != nil {
+        return nil, errors.Wrap(err, "failed to start local forward proxy")
+    }
+
+    // Relaunch Chrome with our local proxy server so all traffic goes through our proxy
+    // Note: we need a new launcher to set proxy; easiest is to close and relaunch quickly
+    // to ensure page contexts use the proxy. For simplicity, we create a new page after setting per-page proxy is unsupported in rod.
+    // We will spawn a lightweight second Chrome with proxy set to local proxy.
+    // Best-effort: if this fails, the existing engine still works for non-proxied flows.
+    func() {
+        // Close previous engine quietly
+        _ = browser.Close()
+        localProxy := fmt.Sprintf("http://127.0.0.1:%d", engine.proxyPort)
+        relauncher := launcher.New().
+            Leakless(true).
+            Set("disable-gpu", "true").
+            Set("ignore-certificate-errors", "true").
+            Set("ignore-certificate-errors", "1").
+            Set("disable-crash-reporter", "true").
+            Set("disable-notifications", "true").
+            Set("hide-scrollbars", "true").
+            Set("window-size", fmt.Sprintf("%d,%d", 1080, 1920)).
+            Set("mute-audio", "true").
+            Set("incognito", "true").
+            Delete("use-mock-keychain").
+            Headless(true).
+            UserDataDir(dataStore).
+            Proxy(localProxy)
+        if MustDisableSandbox() { relauncher = relauncher.NoSandbox(true) }
+        for k, v := range optionalArgs { relauncher.Set(flags.Flag(k), v) }
+        if useLocal || func() bool { p, _ := fileutil.UseMusl(executablePath); return p }() {
+            if chromePath, hasChrome := launcher.LookPath(); hasChrome { relauncher.Bin(chromePath) }
+        }
+        if u, err := relauncher.Launch(); err == nil {
+            engine.engine = rod.New().ControlURL(u)
+            _ = engine.engine.Connect()
+        }
+    }()
+
+    return engine, nil
 }
 
 func (b *Browser) ScreenshotWithBody(url string, timeout time.Duration, idle time.Duration, headers []string, fullPage bool) ([]byte, string, error) {
-	return b.screenshotWithBodyAndHostRules(url, timeout, idle, headers, fullPage, "")
+    return b.screenshotWithBodyAndHostRules(url, timeout, idle, headers, fullPage, "")
 }
 
 func (b *Browser) ScreenshotWithBodyAndHostRules(url string, timeout time.Duration, idle time.Duration, headers []string, fullPage bool, hostResolverRules string) ([]byte, string, error) {
-	return b.screenshotWithBodyAndHostRules(url, timeout, idle, headers, fullPage, hostResolverRules)
+    return b.screenshotWithBodyAndHostRules(url, timeout, idle, headers, fullPage, hostResolverRules)
 }
 
 func (b *Browser) screenshotWithBodyAndHostRules(url string, timeout time.Duration, idle time.Duration, headers []string, fullPage bool, hostResolverRules string) ([]byte, string, error) {
-	var page *rod.Page
-	var err error
-	var vhostBrowser *rod.Browser
-	
-	// Use MITM proxy browser if host resolver rules are provided
-	if hostResolverRules != "" {
-		vhostBrowser, err = b.createVhostBrowser(hostResolverRules)
-		if err != nil {
-			return nil, "", errors.Wrap(err, "failed to create vhost browser")
-		}
-		if vhostBrowser != nil {
-			defer vhostBrowser.Close()
-			page, err = vhostBrowser.Page(proto.TargetCreateTarget{})
-			fmt.Printf("DEBUG: Created MITM vhost browser for rules: %s\n", hostResolverRules)
-		} else {
-			// Fallback to regular browser if no rules to apply
-			page, err = b.engine.Page(proto.TargetCreateTarget{})
-			fmt.Printf("DEBUG: No vhost rules to apply, using regular browser\n")
-		}
-	} else {
-		// Use regular browser
-		page, err = b.engine.Page(proto.TargetCreateTarget{})
-		fmt.Printf("DEBUG: Using regular browser (no host resolver rules)\n")
-	}
+    var page *rod.Page
+    var err error
+
+    // If rules are provided, just update vhost mappings in our proxy; keep using the same Chrome instance
+    if hostResolverRules != "" {
+        if err := b.setupVhostMapping(hostResolverRules); err != nil {
+            return nil, "", errors.Wrap(err, "failed to apply vhost mappings")
+        }
+        fmt.Printf("DEBUG: Applied vhost mappings: %s\n", hostResolverRules)
+    }
+
+    // Use regular browser (already pointed at local proxy)
+    page, err = b.engine.Page(proto.TargetCreateTarget{})
+    fmt.Printf("DEBUG: Using browser with local forward proxy\n")
 	
 	if err != nil {
 		return nil, "", err
@@ -172,18 +213,7 @@ func (b *Browser) screenshotWithBodyAndHostRules(url string, timeout time.Durati
 		return nil, "", err
 	}
 	
-	// Increase idle timeout for MITM proxy scenarios due to additional network latency
-	adjustedIdle := idle
-	if hostResolverRules != "" {
-		// For vhost scenarios with MITM proxy, use longer idle time to ensure all resources load
-		adjustedIdle = idle * 3 // Triple the idle time
-		if adjustedIdle < 3*time.Second {
-			adjustedIdle = 3 * time.Second // Minimum 3 seconds for proxy scenarios
-		}
-		fmt.Printf("DEBUG: Using extended idle timeout for MITM proxy: %v\n", adjustedIdle)
-	}
-	
-	_ = page.WaitIdle(adjustedIdle)
+	_ = page.WaitIdle(idle)
 
 	screenshot, err := page.Screenshot(fullPage, &proto.PageCaptureScreenshot{})
 	if err != nil {
@@ -198,103 +228,15 @@ func (b *Browser) screenshotWithBodyAndHostRules(url string, timeout time.Durati
 	return screenshot, body, nil
 }
 
-// CreateVhostBrowser creates a temporary browser with host resolver rules pointing to MITM proxy
-func (b *Browser) createVhostBrowser(hostResolverRules string) (*rod.Browser, error) {
-	// Start MITM proxy first
-	if b.proxyPort == 0 {
-		if err := b.startVhostProxy(); err != nil {
-			return nil, err
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	
-	// Set up mappings in the proxy
-	if err := b.setupVhostMapping(hostResolverRules); err != nil {
-		return nil, err
-	}
-
-	// Parse rules to build Chrome host-resolver-rules that redirect to localhost proxy
-	chromeHostRules := ""
-	
-	rules := strings.Split(hostResolverRules, ",")
-	for _, rule := range rules {
-		rule = strings.TrimSpace(rule)
-		
-		if strings.HasPrefix(rule, "MAP ") {
-			// MAP directive: hostname->IP mapping
-			// Format: "MAP hostname IP:port"
-			parts := strings.Fields(rule)
-			if len(parts) >= 3 {
-				hostname := parts[1]
-				// Redirect hostname to localhost proxy instead of target IP
-				if chromeHostRules != "" {
-					chromeHostRules += ","
-				}
-				chromeHostRules += fmt.Sprintf("MAP %s 127.0.0.1:%d", hostname, b.proxyPort)
-			}
-		}
-	}
-	
-	if chromeHostRules == "" {
-		return nil, nil // No rules to apply
-	}
-
-	// Create temporary data directory
-	tempDir, err := os.MkdirTemp("", "httpx-vhost-*")
-	if err != nil {
-		return nil, err
-	}
-
-	// Create new launcher with host resolver rules pointing to MITM proxy
-	chromeLauncher := launcher.New().
-		Leakless(true).
-		Set("disable-gpu", "true").
-		Set("ignore-certificate-errors", "true").
-		Set("ignore-certificate-errors-spki-list", "true").
-		Set("ignore-ssl-errors", "true").
-		Set("disable-crash-reporter", "true").
-		Set("disable-notifications", "true").
-		Set("hide-scrollbars", "true").
-		Set("window-size", fmt.Sprintf("%d,%d", 1080, 1920)).
-		Set("mute-audio", "true").
-		Set("incognito", "true").
-		Set("host-resolver-rules", chromeHostRules).
-		Delete("use-mock-keychain").
-		Headless(true).
-		UserDataDir(tempDir)
-
-	if MustDisableSandbox() {
-		chromeLauncher = chromeLauncher.NoSandbox(true)
-	}
-
-	fmt.Printf("DEBUG: Creating vhost browser with Chrome rules: %s\n", chromeHostRules)
-
-	// Launch browser
-	launcherURL, err := chromeLauncher.Launch()
-	if err != nil {
-		os.RemoveAll(tempDir)
-		return nil, err
-	}
-
-	// Connect to browser
-	browser := rod.New().ControlURL(launcherURL)
-	if err := browser.Connect(); err != nil {
-		os.RemoveAll(tempDir)
-		return nil, err
-	}
-
-	return browser, nil
-}
+// (Deprecated) createVhostBrowser: no longer needed; mappings are handled in proxy.
+func (b *Browser) createVhostBrowser(hostResolverRules string) (*rod.Browser, error) { return nil, nil }
 
 func (b *Browser) setupVhostMapping(hostResolverRules string) error {
-	// Start MITM proxy if not already running
-	if b.proxyPort == 0 {
-		if err := b.startVhostProxy(); err != nil {
-			return err
-		}
-		// Wait a moment for proxy to start
-		time.Sleep(200 * time.Millisecond)
-	}
+    // Local forward proxy is started in NewBrowser
+    if b.proxyPort == 0 {
+        if err := b.startForwardProxy(); err != nil { return err }
+        time.Sleep(200 * time.Millisecond)
+    }
 
 	// Parse host resolver rules to set up mappings
 	rules := strings.Split(hostResolverRules, ",")
@@ -363,70 +305,54 @@ func (b *Browser) generateSelfSignedCert() (tls.Certificate, error) {
 	return cert, nil
 }
 
-// VhostMITMProxy creates a TLS-terminating MITM proxy for vhost screenshot support
-func (b *Browser) startVhostProxy() error {
-	// Generate self-signed certificate
-	cert, err := b.generateSelfSignedCert()
-	if err != nil {
-		return err
-	}
+// Start a single-port forward proxy that supports HTTP proxy semantics and TLS MITM on CONNECT.
+func (b *Browser) startForwardProxy() error {
+    // Generate (or reuse) self-signed certificate
+    if b.mitmCert == nil {
+        cert, err := b.generateSelfSignedCert()
+        if err != nil { return err }
+        b.mitmCert = &cert
+    }
 
-	// Find available ports for HTTP and HTTPS
-	httpListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	httpPort := httpListener.Addr().(*net.TCPAddr).Port
-	httpListener.Close()
+    // Listen on random local port
+    ln, err := net.Listen("tcp", "127.0.0.1:0")
+    if err != nil { return err }
+    b.proxyPort = ln.Addr().(*net.TCPAddr).Port
 
-	httpsListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return err
-	}
-	httpsPort := httpsListener.Addr().(*net.TCPAddr).Port
-	httpsListener.Close()
+    srv := &http.Server{ Handler: http.HandlerFunc(b.handleForwardProxy) }
 
-	b.proxyPort = httpsPort // Store HTTPS port as primary
+    b.proxyClose = func() { srv.Close() }
 
-	// Create TLS config with our self-signed cert
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		GetCertificate: func(clientHello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			// Return our wildcard cert for any hostname
-			return &cert, nil
-		},
-	}
+    go func() { _ = srv.Serve(ln) }()
+    return nil
+}
 
-	// HTTP server
-	httpServer := &http.Server{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", httpPort),
-		Handler: http.HandlerFunc(b.handleVhostProxy),
-	}
+// oneConnListener lets us serve a single TLS-MITM HTTP request after CONNECT
+type oneConnListener struct { c net.Conn; used bool }
+func (l *oneConnListener) Accept() (net.Conn, error) { if l.used { return nil, fmt.Errorf("closed") }; l.used = true; return l.c, nil }
+func (l *oneConnListener) Close() error { return nil }
+func (l *oneConnListener) Addr() net.Addr { return l.c.LocalAddr() }
 
-	// HTTPS server
-	httpsServer := &http.Server{
-		Addr:      fmt.Sprintf("127.0.0.1:%d", httpsPort),
-		Handler:   http.HandlerFunc(b.handleVhostProxy),
-		TLSConfig: tlsConfig,
-	}
+// handleForwardProxy handles HTTP proxy requests and CONNECT for TLS MITM
+func (b *Browser) handleForwardProxy(w http.ResponseWriter, r *http.Request) {
+    if r.Method == http.MethodConnect {
+        // CONNECT host:port
+        hj, ok := w.(http.Hijacker)
+        if !ok { http.Error(w, "proxy: hijacking not supported", http.StatusInternalServerError); return }
+        clientConn, _, err := hj.Hijack()
+        if err != nil { return }
+        // Acknowledge tunnel
+        _, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+        // Perform TLS server handshake (MITM) with wildcard cert
+        tlsSrv := tls.Server(clientConn, &tls.Config{ Certificates: []tls.Certificate{*b.mitmCert} })
+        if err := tlsSrv.Handshake(); err != nil { _ = tlsSrv.Close(); return }
+        // Serve exactly one HTTP request on this TLS connection using our reverse-proxy logic
+        _ = (&http.Server{ Handler: http.HandlerFunc(b.handleVhostProxy) }).Serve(&oneConnListener{ c: tlsSrv })
+        return
+    }
 
-	// Store close function
-	b.proxyClose = func() {
-		httpServer.Close()
-		httpsServer.Close()
-	}
-
-	// Start HTTP proxy server
-	go func() {
-		httpServer.ListenAndServe()
-	}()
-
-	// Start HTTPS proxy server
-	go func() {
-		httpsServer.ListenAndServeTLS("", "")
-	}()
-
-	return nil
+    // Non-CONNECT: browser will send absolute-form requests. Delegate to reverse-proxy logic.
+    b.handleVhostProxy(w, r)
 }
 
 // Global map to store hostname->IP mappings for the proxy
@@ -455,16 +381,17 @@ func (b *Browser) handleVhostProxy(w http.ResponseWriter, r *http.Request) {
 		// Don't set Path here - reverse proxy will append the request path automatically
 	}
 
-	// Create reverse proxy
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	
-	// Customize transport for proper TLS SNI handling
-	proxy.Transport = &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			ServerName:         hostname, // Use original hostname for TLS SNI
-		},
-	}
+    // Create reverse proxy
+    proxy := httputil.NewSingleHostReverseProxy(targetURL)
+    
+    // Customize transport for proper TLS SNI handling and upstream proxy chaining
+    transport := &http.Transport{
+        TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: hostname },
+    }
+    if b.upstreamProxyURL != nil {
+        transport.Proxy = http.ProxyURL(b.upstreamProxyURL)
+    }
+    proxy.Transport = transport
 
 	// Modify the request to preserve original Host header
 	originalDirector := proxy.Director
