@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -250,7 +251,19 @@ func (b *Browser) setupVhostMapping(hostResolverRules string) error {
 			if len(parts) >= 3 {
 				hostname := parts[1]
 				targetAddr := parts[2]
+				// Store mapping for both with-port and host-only keys
+				hostOnly := hostname
+				if strings.Contains(hostOnly, ":") {
+					if h, _, err := net.SplitHostPort(hostOnly); err == nil {
+						hostOnly = h
+					} else {
+						hostOnly = strings.Split(hostOnly, ":")[0]
+					}
+				}
 				vhostMappings[hostname] = targetAddr
+				vhostMappings[hostOnly] = targetAddr
+				// Also store reverse mapping for SNI lookup (host-only)
+				sniMappings[targetAddr] = hostOnly
 				fmt.Printf("DEBUG: MITM proxy mapping: %s -> %s\n", hostname, targetAddr)
 			}
 		}
@@ -346,8 +359,13 @@ func (b *Browser) handleForwardProxy(w http.ResponseWriter, r *http.Request) {
         // Perform TLS server handshake (MITM) with wildcard cert
         tlsSrv := tls.Server(clientConn, &tls.Config{ Certificates: []tls.Certificate{*b.mitmCert} })
         if err := tlsSrv.Handshake(); err != nil { _ = tlsSrv.Close(); return }
-        // Serve exactly one HTTP request on this TLS connection using our reverse-proxy logic
-        _ = (&http.Server{ Handler: http.HandlerFunc(b.handleVhostProxy) }).Serve(&oneConnListener{ c: tlsSrv })
+        // Serve exactly one HTTP request on this TLS connection using our reverse-proxy logic.
+        // Mark this flow as originating from CONNECT so downstream knows the scheme should be HTTPS.
+        _ = (&http.Server{ Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            r = r.WithContext(context.WithValue(r.Context(), "proxy-connect", true))
+            r.Header.Set("X-Proxy-Connect", "1")
+            b.handleVhostProxy(w, r)
+        }) }).Serve(&oneConnListener{ c: tlsSrv })
         return
     }
 
@@ -357,6 +375,8 @@ func (b *Browser) handleForwardProxy(w http.ResponseWriter, r *http.Request) {
 
 // Global map to store hostname->IP mappings for the proxy
 var vhostMappings = make(map[string]string)
+// Global map to store IP->hostname mappings for reverse SNI lookup
+var sniMappings = make(map[string]string)
 
 func (b *Browser) handleVhostProxy(w http.ResponseWriter, r *http.Request) {
 	hostname := r.Host
@@ -367,10 +387,41 @@ func (b *Browser) handleVhostProxy(w http.ResponseWriter, r *http.Request) {
 		// If no mapping, just pass through
 		targetIP = hostname
 	}
+	
+	// Determine the correct hostname for SNI
+	sniHostname := hostname
+	
+	// First try exact match with the target IP
+	if sniName, sniExists := sniMappings[targetIP]; sniExists {
+		sniHostname = sniName
+	} else if sniName, sniExists := sniMappings[hostname]; sniExists {
+		// Try with the hostname (in case it's already the target)
+		sniHostname = sniName
+	} else {
+		// Try reverse lookup by checking if hostname is an IP that matches any target
+		for vhost, target := range vhostMappings {
+			if target == hostname || strings.HasPrefix(target, hostname+":") {
+				sniHostname = vhost
+				break
+			}
+		}
+	}
+	
+	// Extract hostname only (remove port) for TLS SNI
+	tlsSniHostname := sniHostname
+	if strings.Contains(tlsSniHostname, ":") {
+		if host, _, err := net.SplitHostPort(tlsSniHostname); err == nil {
+			tlsSniHostname = host
+		}
+	}
 
-	// Determine target scheme
+	// Determine target scheme based on original request and CONNECT context
 	scheme := "http"
-	if r.TLS != nil {
+	if r.Header.Get("X-Proxy-Connect") == "1" || r.Context().Value("proxy-connect") == true {
+		scheme = "https"
+	} else if r.URL != nil && r.URL.Scheme != "" {
+		scheme = r.URL.Scheme
+	} else if strings.HasSuffix(targetIP, ":443") || strings.HasSuffix(hostname, ":443") {
 		scheme = "https"
 	}
 
@@ -386,7 +437,7 @@ func (b *Browser) handleVhostProxy(w http.ResponseWriter, r *http.Request) {
     
     // Customize transport for proper TLS SNI handling and upstream proxy chaining
     transport := &http.Transport{
-        TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: hostname },
+        TLSClientConfig: &tls.Config{ InsecureSkipVerify: true, ServerName: tlsSniHostname },
     }
     if b.upstreamProxyURL != nil {
         transport.Proxy = http.ProxyURL(b.upstreamProxyURL)
@@ -401,8 +452,10 @@ func (b *Browser) handleVhostProxy(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Host", hostname)
 		
 		// Debug output
-		fmt.Printf("MITM Proxy: %s %s -> %s (SNI: %s)\n", req.Method, req.URL.String(), targetURL.String(), hostname)
+		fmt.Printf("MITM Proxy: %s %s -> %s (SNI: %s)\n", req.Method, req.URL.String(), targetURL.String(), tlsSniHostname)
 	}
+	
+	// Don't modify response headers to avoid breaking browser compatibility
 
 	proxy.ServeHTTP(w, r)
 }

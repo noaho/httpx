@@ -1083,7 +1083,36 @@ func (r *Runner) RunEnumeration() {
 				hostFilename := strings.ReplaceAll(URL.Host, ":", "_")
 				domainResponseBaseDir := filepath.Join(r.options.StoreResponseDir, "response")
 				domainScreenshotBaseDir := filepath.Join(r.options.StoreResponseDir, "screenshot")
-				responseBaseDir := filepath.Join(domainResponseBaseDir, hostFilename)
+				// Prefer vhost Host header for response directory if provided via vhost-input
+				responseHostFilename := hostFilename
+				if resp.HostHeader != nil && *resp.HostHeader != "" {
+					// sanitize helper
+					sanitize := func(in string) string {
+						in = strings.TrimSpace(in)
+						b := make([]rune, 0, len(in))
+						for _, r := range in {
+							if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+								b = append(b, r)
+							} else {
+								b = append(b, '_')
+							}
+						}
+						return string(b)
+					}
+					hostPart := sanitize(*resp.HostHeader)
+					sniPart := hostPart
+					if resp.SNI != nil && *resp.SNI != "" {
+						sniPart = sanitize(*resp.SNI)
+					}
+					// Use target host without port (from URL)
+					targetHost := URL.Host
+					if strings.Contains(targetHost, ":") {
+						targetHost = strings.Split(targetHost, ":")[0]
+					}
+					ipPart := sanitize(targetHost)
+					responseHostFilename = fmt.Sprintf("%s_%s_%s", hostPart, sniPart, ipPart)
+				}
+				responseBaseDir := filepath.Join(domainResponseBaseDir, responseHostFilename)
 				screenshotBaseDir := filepath.Join(domainScreenshotBaseDir, hostFilename)
 
 				var responsePath, screenshotPath, screenshotPathRel string
@@ -1116,8 +1145,39 @@ func (r *Runner) RunEnumeration() {
 				}
 
 				if r.scanopts.Screenshot {
+					// Prefer vhost Host header for screenshot directory if provided via vhost-input
+					screenshotHostFilename := hostFilename
+					if resp.HostHeader != nil && *resp.HostHeader != "" {
+						// sanitize helper
+						sanitize := func(in string) string {
+							in = strings.TrimSpace(in)
+							b := make([]rune, 0, len(in))
+							for _, r := range in {
+								if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+									b = append(b, r)
+								} else {
+									b = append(b, '_')
+								}
+							}
+							return string(b)
+						}
+						hostPart := sanitize(*resp.HostHeader)
+						sniPart := hostPart
+						if resp.SNI != nil && *resp.SNI != "" {
+							sniPart = sanitize(*resp.SNI)
+						}
+						// Use target host without port (from URL)
+						targetHost := URL.Host
+						if strings.Contains(targetHost, ":") {
+							targetHost = strings.Split(targetHost, ":")[0]
+						}
+						ipPart := sanitize(targetHost)
+						screenshotHostFilename = fmt.Sprintf("%s_%s_%s", hostPart, sniPart, ipPart)
+					}
+					// recompute base dir using screenshotHostFilename
+					screenshotBaseDir = filepath.Join(domainScreenshotBaseDir, screenshotHostFilename)
 					screenshotPath = fileutilz.AbsPathOrDefault(filepath.Join(screenshotBaseDir, screenshotResponseFile))
-					screenshotPathRel = filepath.Join(hostFilename, screenshotResponseFile)
+					screenshotPathRel = filepath.Join(screenshotHostFilename, screenshotResponseFile)
 					
 					// Only create directory and write screenshot file if we have actual screenshot data
 					if len(resp.ScreenshotBytes) > 0 {
@@ -2568,9 +2628,35 @@ retry:
 	hash := hashes.Sha1([]byte(domainFile))
 	domainResponseFile := fmt.Sprintf("%s.txt", hash)
 	hostFilename := strings.ReplaceAll(URL.Host, ":", "_")
-
 	domainResponseBaseDir := filepath.Join(scanopts.StoreResponseDirectory, "response")
-	responseBaseDir := filepath.Join(domainResponseBaseDir, hostFilename)
+	// Determine response directory name: prefer vhost Host header (and SNI/IP) when provided
+	responseHostFilename := hostFilename
+	if hostHeader := getHostHeaderForOutput(target, nil); hostHeader != nil && *hostHeader != "" {
+		// sanitize helper
+		sanitize := func(in string) string {
+			in = strings.TrimSpace(in)
+			b := make([]rune, 0, len(in))
+			for _, r := range in {
+				if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+					b = append(b, r)
+				} else {
+					b = append(b, '_')
+				}
+			}
+			return string(b)
+		}
+		hostPart := sanitize(*hostHeader)
+		// Default sniPart to hostPart here (streaming branch has SNI in resp later; naming symmetry only)
+		sniPart := hostPart
+		// Use target host without port (from URL)
+		targetHost := URL.Host
+		if strings.Contains(targetHost, ":") {
+			targetHost = strings.Split(targetHost, ":")[0]
+		}
+		ipPart := sanitize(targetHost)
+		responseHostFilename = fmt.Sprintf("%s_%s_%s", hostPart, sniPart, ipPart)
+	}
+	responseBaseDir := filepath.Join(domainResponseBaseDir, responseHostFilename)
 
 	var responsePath string
 	// store response
@@ -2645,9 +2731,14 @@ retry:
 		gologger.Debug().Msgf("Screenshot debug: target.CustomHost='%s', target.Host='%s', fullURL='%s'", customHost, target.Host, fullURL)
 		
 		if target.CustomHost != nil && *target.CustomHost != "" {
-			// For vhost input, use hostname URL but configure Chrome to resolve it to the target IP
-			// This handles true vhost scenarios where DNS doesn't resolve correctly
-			screenshotURL = fullURL // Use hostname URL
+			// For vhost input, always navigate the browser using the hostname URL so Host/SNI are consistent
+			// even if the HTTP client used IP to fetch content.
+			if parsed, err := url.Parse(fullURL); err == nil {
+				parsed.Host = *target.CustomHost
+				screenshotURL = parsed.String()
+			} else {
+				screenshotURL = fullURL
+			}
 			
 			// Parse target IP from target.Host
 			var targetIP string
@@ -3093,8 +3184,12 @@ func (r *Runner) parseURL(url string) (*urlutil.URL, error) {
 
 // getHostHeaderForOutput returns the Host header value only when explicitly set via vhost-input
 func getHostHeaderForOutput(target httpx.Target, req *retryablehttp.Request) *string {
-	if target.CustomHost != nil && req != nil {
-		return &req.Host // Return pointer to the custom Host header that was explicitly set
+	if target.CustomHost != nil {
+		if req != nil && req.Host != "" {
+			host := req.Host
+			return &host
+		}
+		return target.CustomHost
 	}
 	return nil // Return nil to omit from JSON output (due to omitempty tag)
 }
